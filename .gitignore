@@ -1,0 +1,13 @@
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfplan
+tfplan
+tfplan.txt
+override.tf
+override.tf.json
+*_override.tf
+.terraformrc
+terraform.rc
+# NOTE: commit .terraform.lock.hcl so CI uses exactly the provider versions you tested

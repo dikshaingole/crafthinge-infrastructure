@@ -1,0 +1,27 @@
+parameters:
+  - name: terraformVersion
+    type: string
+  - name: installTrivy
+    type: boolean
+    default: false
+  - name: trivyVersion
+    type: string
+    default: '0.58.1'
+
+steps:
+  - bash: |
+      set -euo pipefail
+      curl -sSfLo /tmp/terraform.zip \
+        "https://releases.hashicorp.com/terraform/${{ parameters.terraformVersion }}/terraform_${{ parameters.terraformVersion }}_linux_amd64.zip"
+      unzip -o -q /tmp/terraform.zip -d /tmp/tf
+      sudo mv /tmp/tf/terraform /usr/local/bin/terraform
+      terraform version
+    displayName: Install Terraform ${{ parameters.terraformVersion }}
+
+  - ${{ if eq(parameters.installTrivy, true) }}:
+      - bash: |
+          set -euo pipefail
+          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin v${{ parameters.trivyVersion }}
+          trivy --version
+        displayName: Install Trivy ${{ parameters.trivyVersion }}

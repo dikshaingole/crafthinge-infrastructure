@@ -1,0 +1,184 @@
+# =============================================================================
+# CraftHinge - INFRASTRUCTURE pipeline (Terraform -> Azure)
+#
+#   PR to main        : Validate + Plan  (plan is shown for review, nothing applied)
+#   Merge to main     : Validate + Plan + [manual approval] + Apply   (dev by default)
+#   Manual run        : pick stack = shared | dev | qa | prod
+#
+# This pipeline never touches application deployments. Apps are deployed by
+# Argo CD from the GitOps repo.
+# =============================================================================
+name: tf-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [terraform]
+
+pr:
+  branches:
+    include: [main]
+  paths:
+    include: [terraform]
+
+parameters:
+  - name: stack
+    displayName: Terraform stack to plan/apply
+    type: string
+    default: dev
+    values: [shared, dev, qa, prod]
+
+variables:
+  - name: terraformVersion
+    value: '1.9.8'
+  # One WIF service connection per environment, each scoped to its own
+  # subscription/resource group (prod connection cannot touch dev, and vice versa).
+  - name: serviceConnection
+    value: sc-crafthinge-${{ parameters.stack }}
+  - name: scriptsDir
+    value: $(Build.SourcesDirectory)/pipelines/scripts
+  - ${{ if eq(parameters.stack, 'shared') }}:
+      - name: WORKING_DIR
+        value: $(Build.SourcesDirectory)/terraform/shared
+      - name: BACKEND_CONFIG
+        value: backend.hcl
+      - name: TFVARS_FILE
+        value: shared.tfvars
+  - ${{ else }}:
+      - name: WORKING_DIR
+        value: $(Build.SourcesDirectory)/terraform
+      - name: BACKEND_CONFIG
+        value: backends/${{ parameters.stack }}.hcl
+      - name: TFVARS_FILE
+        value: environments/${{ parameters.stack }}.tfvars
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  # ---------------------------------------------------------------- 1. VALIDATE
+  - stage: Validate
+    displayName: Init / Validate / Format / Security scan
+    jobs:
+      - job: Validate
+        steps:
+          - checkout: self
+          - template: templates/install-tools.yml
+            parameters:
+              terraformVersion: $(terraformVersion)
+              installTrivy: true
+
+          - bash: terraform fmt -check -recursive -diff
+            displayName: terraform fmt -check
+            workingDirectory: $(Build.SourcesDirectory)/terraform
+
+          # -backend=false: syntax/type checking needs no Azure credentials.
+          - bash: |
+              set -euo pipefail
+              terraform init -backend=false -input=false
+              terraform validate
+            displayName: terraform init (no backend) + validate
+            workingDirectory: $(WORKING_DIR)
+
+          # IaC misconfiguration scan. Policy: CRITICAL fails the build,
+          # HIGH and below are reported for review.
+          - bash: |
+              set -euo pipefail
+              trivy config --severity HIGH,CRITICAL --exit-code 0 --format table .
+              trivy config --severity CRITICAL --exit-code 1 .
+            displayName: Trivy IaC scan
+            workingDirectory: $(Build.SourcesDirectory)/terraform
+
+  # ---------------------------------------------------------------- 2. PLAN
+  - stage: Plan
+    displayName: Plan (${{ parameters.stack }})
+    dependsOn: Validate
+    jobs:
+      - job: PlanJob
+        steps:
+          - checkout: self
+          - template: templates/install-tools.yml
+            parameters:
+              terraformVersion: $(terraformVersion)
+
+          - task: AzureCLI@2
+            displayName: terraform init
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: scriptPath
+              scriptPath: $(scriptsDir)/tf-init.sh
+              addSpnToEnvironment: true
+              workingDirectory: $(WORKING_DIR)
+
+          - task: AzureCLI@2
+            name: plan # referenced by the Apply stage condition
+            displayName: terraform plan
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: scriptPath
+              scriptPath: $(scriptsDir)/tf-plan.sh
+              addSpnToEnvironment: true
+              workingDirectory: $(WORKING_DIR)
+
+          # The plan file can contain secret values -> artifact access is
+          # limited to the project; it is never posted to the PR.
+          - publish: $(Build.ArtifactStagingDirectory)/plan
+            artifact: tfplan-${{ parameters.stack }}
+            displayName: Publish plan artifact
+
+  # ---------------------------------------------------------------- 3+4. APPROVAL + APPLY
+  # The approval is configured on the Azure DevOps *environment*
+  # "crafthinge-infra-<stack>" (Pipelines > Environments > Approvals and checks).
+  # The deployment job pauses there until an approver reviews tfplan.txt.
+  - stage: Apply
+    displayName: Apply (${{ parameters.stack }})
+    dependsOn: Plan
+    condition: >-
+      and(
+        succeeded(),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+        ne(variables['Build.Reason'], 'PullRequest'),
+        eq(dependencies.Plan.outputs['PlanJob.plan.hasChanges'], 'true')
+      )
+    jobs:
+      - deployment: ApplyJob
+        environment: crafthinge-infra-${{ parameters.stack }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - download: current
+                  artifact: tfplan-${{ parameters.stack }}
+                - template: templates/install-tools.yml
+                  parameters:
+                    terraformVersion: $(terraformVersion)
+
+                # Use the provider lock file from Plan so Apply runs identical provider versions.
+                - bash: cp "$(Pipeline.Workspace)/tfplan-${{ parameters.stack }}/.terraform.lock.hcl" "$(WORKING_DIR)/.terraform.lock.hcl"
+                  displayName: Restore provider lock file
+
+                - task: AzureCLI@2
+                  displayName: terraform init
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: scriptPath
+                    scriptPath: $(scriptsDir)/tf-init.sh
+                    addSpnToEnvironment: true
+                    workingDirectory: $(WORKING_DIR)
+
+                - task: AzureCLI@2
+                  displayName: terraform apply (approved plan)
+                  env:
+                    PLAN_FILE: $(Pipeline.Workspace)/tfplan-${{ parameters.stack }}/tfplan
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: scriptPath
+                    scriptPath: $(scriptsDir)/tf-apply.sh
+                    addSpnToEnvironment: true
+                    workingDirectory: $(WORKING_DIR)
